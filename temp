@@ -1,0 +1,156 @@
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, Sample};
+use eyre::{bail, Result};
+use std::sync::{Arc, Mutex};
+
+fn init_audio() -> Result<()> {
+    let host = cpal::default_host();
+
+    // 入力デバイスとストリームの設定
+    let device = host
+        .default_input_device()
+        .expect("failed to find input device");
+
+    println!("Input device: {}", device.name()?);
+
+    let config = device
+        .default_input_config()
+        .expect("Failed to get default input config");
+    println!("Default input config: {:?}", config);
+
+    // WAVファイルの設定
+    const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recorded.wav");
+
+    // 16KHZ 16bit mono
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000 as _, // 常に16kHzで書き込み
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let writer = hound::WavWriter::create(PATH, spec)?;
+    let writer = Arc::new(Mutex::new(Some(writer)));
+
+    println!("Begin recording...");
+
+    let writer_2 = writer.clone();
+
+    let err_fn = move |err| {
+        eprintln!("an error occurred on stream: {}", err);
+    };
+
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels();
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::I8 => device.build_input_stream(
+            &config.into(),
+            move |data, _: &_| write_and_process_input_data::<i8, i8>(data, &writer_2, sample_rate, channels),
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config.into(),
+            move |data, _: &_| write_and_process_input_data::<i16, i16>(data, &writer_2, sample_rate, channels),
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::I32 => device.build_input_stream(
+            &config.into(),
+            move |data, _: &_| write_and_process_input_data::<i32, i32>(data, &writer_2, sample_rate, channels),
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config.into(),
+            move |data, _: &_| write_and_process_input_data::<f32, f32>(data, &writer_2, sample_rate, channels),
+            err_fn,
+            None,
+        )?,
+        sample_format => {
+            bail!("Unsupported sample format '{sample_format}'")
+        }
+    };
+
+    stream.play()?;
+
+    // 録音を約500秒間続ける
+    std::thread::sleep(std::time::Duration::from_secs(500));
+    drop(stream);
+    writer.lock().unwrap().take().unwrap().finalize()?;
+    println!("Recording {} complete!", PATH);
+    Ok(())
+}
+
+type WavWriterHandle = Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>;
+
+fn write_and_process_input_data<T, U>(input: &[T], writer: &WavWriterHandle, sample_rate: u32, channels: u16)
+where
+    T: Sample,
+    U: Sample + hound::Sample + FromSample<T>,
+{
+    // 入力サンプルをf32に変換
+    let samples: Vec<f32> = input
+        .iter()
+        .map(|s| s.to_float_sample().to_sample())
+        .collect();
+
+    // ステレオ音声を希望のサンプルレートにリサンプル
+    let resampled_stereo: Vec<f32> = audio_resample(&samples, sample_rate, 16000, channels);
+    let resampled_i16: Vec<i16> = resampled_stereo
+        .iter()
+        .map(|s| (s * i16::MAX as f32).round() as i16)
+        .collect();
+
+    let resampled_mono = if channels == 1 {
+        resampled_i16
+    } else {
+        // ステレオからモノラルに変換
+        resampled_stereo
+            .chunks(2) // サンプルペア（左、右）ごとに反復
+            .map(|chunk| {
+                let left = chunk[0];
+                let right = chunk[1];
+                let mono = (left + right) / 2.0; // 2つのチャンネルを平均化
+                (mono * i16::MAX as f32).round() as i16
+            })
+            .collect()
+    };
+
+    // WAVファイルにモノラルデータを書き込み
+    if let Ok(mut guard) = writer.try_lock() {
+        if let Some(writer) = guard.as_mut() {
+            for &sample in resampled_mono.iter() {
+                writer.write_sample(sample as i16).ok();
+            }
+        }
+    }
+
+    // ここでリアルタイム処理を行う
+    process_audio_data(&resampled_mono);
+}
+
+fn process_audio_data(data: &[i16]) {
+    // ここにリアルタイム処理のロジックを追加
+    println!("Processing audio data: {:?}", data);
+}
+
+#[tauri::command]
+fn greet(name: &str) -> String {
+    format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![greet])
+        .setup(|app| {
+            // AppHandleをクローンしてスレッドに渡す
+            std::thread::spawn(move || {
+                init_audio().expect("Failed to initialize audio");
+            });
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
